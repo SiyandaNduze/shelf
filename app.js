@@ -120,10 +120,37 @@ function render(){
     (auto().map(g=>`<div class="grp"><h3>${esc(g.name)} <small style="color:var(--mut);font-weight:400">${g.ids.length}</small></h3><div>${g.ids.map(id=>`<span class="tag">${esc(seen[id].title)}</span>`).join('')}</div></div>`).join('')||'<p class="empty">Add at least two anime that share a trait to see groups.</p>');
   if(tab==='acct')h=acctView();
   if(dlg){const a=seen[dlg],x=inL(dlg);h+=`<div class="ov" data-a="close"><div class="dlg"><h2>${esc(a.title)}</h2>${Object.entries(ST).map(([k,n])=>`<button class="btn ${x&&x.status===k?'':'ghost'}" data-a="set" data-v="${k}">${n}</button>`).join('')}${x?'<button class="btn ghost" data-a="set" data-v="">Remove from list</button>':''}<button class="btn ghost" data-a="close">Close</button></div></div>`}
-  const f=document.activeElement&&document.activeElement.id;
-  document.getElementById('app').innerHTML=h;
-  if(f){const e=document.getElementById(f);if(e&&e.tagName==='INPUT'){e.focus();e.setSelectionRange(e.value.length,e.value.length)}}
-}
+  const active = document.activeElement;
+const f = active && active.id;
+
+const value = active &&
+  (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')
+  ? active.value
+  : null;
+
+const start = active && typeof active.selectionStart === 'number'
+  ? active.selectionStart
+  : null;
+
+const end = active && typeof active.selectionEnd === 'number'
+  ? active.selectionEnd
+  : null;
+
+document.getElementById('app').innerHTML = h;
+
+if (f) {
+  const e = document.getElementById(f);
+
+  if (e) {
+    if (value !== null) e.value = value;
+
+    e.focus();
+
+    if (start !== null && e.setSelectionRange) {
+      e.setSelectionRange(start, end);
+    }
+  }
+}}
  
 /* ---------- events ---------- */
 document.addEventListener('click',async e=>{
