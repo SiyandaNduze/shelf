@@ -1,6 +1,6 @@
 /* Shelf — anime tracker. Catalog: AniList (live). Storage: SQLite (sql.js+IndexedDB on web, native SQLite via Capacitor on phones). */
 /* Sync backend: paste your Supabase project URL and anon key (see README). Leave empty for local-only. */
-const CFG={url:'https://gbjnzkvwtmibnxsfyypt.supabase.co/rest/v1/',key:'sb_publishable_rvf8YR0DSV6RLh44Ko2B4g_IBqntee8'};
+const CFG={url:'https://gbjnzkvwtmibnxsfyypt.supabase.co',key:'sb_publishable_rvf8YR0DSV6RLh44Ko2B4g_IBqntee8'};
 const CDN='https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/';
 const GQL=`query($q:String,$g:String,$p:Int,$s:[MediaSort]){Page(page:$p,perPage:30){pageInfo{hasNextPage}media(type:ANIME,isAdult:false,search:$q,genre:$g,sort:$s){id title{romaji english}seasonYear episodes genres tags{name rank}coverImage{large}}}}`;
 const GENRES=['Action','Adventure','Comedy','Drama','Fantasy','Horror','Mahou Shoujo','Mecha','Music','Mystery','Psychological','Romance','Sci-Fi','Slice of Life','Sports','Supernatural','Thriller'];
