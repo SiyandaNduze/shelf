@@ -1,5 +1,5 @@
 /* Shelf — anime tracker. Catalog: AniList (live). Storage: SQLite (sql.js+IndexedDB on web, native SQLite via Capacitor on phones). */
-/* Sync backend: paste your Supabase project URL and anon key (see README). Leave empty for local-only. */
+/* Supabase project URL + publishable key. Never put a service_role/secret key in this public app. */
 const CFG={url:'https://gbjnzkvwtmibnxsfyypt.supabase.co',key:'sb_publishable_rvf8YR0DSV6RLh44Ko2B4g_IBqntee8'};
 const CDN='https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/';
 const GQL=`query($q:String,$g:String,$p:Int,$s:[MediaSort]){Page(page:$p,perPage:30){pageInfo{hasNextPage}media(type:ANIME,isAdult:false,search:$q,genre:$g,sort:$s){id title{romaji english}seasonYear episodes genres tags{name rank}coverImage{large}}}}`;
@@ -174,16 +174,41 @@ document.addEventListener('click',async e=>{
   else if(a==='uncat'){await DB.run('DELETE FROM cat_item WHERE cat=? AND anime_id=?',[t.dataset.c,id]);await commit()}
   else if(a==='signin'||a==='signup'){
     const em=document.getElementById('em').value.trim(),pw=document.getElementById('pw').value;
-    try{syncMsg='';const j=await authCall(a==='signin'?'token?grant_type=password':'signup',{email:em,password:pw});
-      if(j.access_token){keep(j);syncMsg='Signed in.';render();await sync();return}
-      syncMsg='Check your email to confirm your account, then sign in.'}catch(err){syncMsg=err.message}}
+    try{
+      syncMsg='';
+      const redirectTo=window.location.origin+window.location.pathname;
+      const result=a==='signin'
+        ? await sbClient.auth.signInWithPassword({email:em,password:pw})
+        : await sbClient.auth.signUp({email:em,password:pw,options:{emailRedirectTo:redirectTo}});
+      if(result.error)throw result.error;
+      if(result.data.session){
+        setAuth(result.data.session);accountPassword='';syncMsg='Signed in.';render();await sync();return;
+      }
+      accountPassword='';
+      syncMsg='Account created. Check your email to confirm, then return here to sign in.';
+    }catch(err){syncMsg=err.message}}
+  else if(a==='google'||a==='github'){
+    try{
+      const {error}=await sbClient.auth.signInWithOAuth({
+        provider:a,
+        options:{redirectTo:window.location.origin+window.location.pathname}
+      });
+      if(error)throw error;
+      return;
+    }catch(err){syncMsg=err.message}
+  }
   else if(a==='syncnow'){await sync();return}
-  else if(a==='signout'){await sync();const bad=syncMsg.startsWith('Couldn');
+  else if(a==='signout'){await sync();const bad=syncMsg.startsWith('Sync failed');
     if(!confirm(bad?'Some changes haven’t synced and will be lost. Sign out anyway?':'Sign out? Your list stays in your account.'))return;
-    for(const t of['entry','cat','cat_item','anime','meta'])await DB.run('DELETE FROM '+t);setAuth(null);syncMsg='';await reload()}
+    const {error}=await sbClient.auth.signOut();if(error)syncMsg=error.message;
+    for(const t of['entry','cat','cat_item','anime','meta'])await DB.run('DELETE FROM '+t);setAuth(null);accountPassword='';syncMsg='';await reload()}
   render();
 });
-document.addEventListener('input',e=>{if(e.target.id==='q'){q=e.target.value;clearTimeout(timer);timer=setTimeout(()=>load(true),450)}});
+document.addEventListener('input',e=>{
+  if(e.target.id==='q'){q=e.target.value;clearTimeout(timer);timer=setTimeout(()=>load(true),450)}
+  if(e.target.id==='em')accountEmail=e.target.value;
+  if(e.target.id==='pw')accountPassword=e.target.value;
+});
 document.addEventListener('change',async e=>{
   const t=e.target,a=t.dataset.a;
   if(t.id==='gen'){gen=t.value;return load(true)}
@@ -196,18 +221,25 @@ document.addEventListener('change',async e=>{
  
  
 /* ---------- accounts & sync (Supabase REST, last-write-wins) ---------- */
-let auth=null,syncMsg='',pushT;
-try{auth=JSON.parse(localStorage.getItem('shelf-auth'))}catch(e){}
-const setAuth=a=>{auth=a;try{a?localStorage.setItem('shelf-auth',JSON.stringify(a)):localStorage.removeItem('shelf-auth')}catch(e){}};
+let auth=null,syncMsg='',pushT,accountEmail='',accountPassword='';
+const sbClient=window.supabase.createClient(CFG.url,CFG.key,{
+  auth:{flowType:'pkce',detectSessionInUrl:true,persistSession:true,autoRefreshToken:true}
+});
+const setAuth=session=>{
+  auth=session?{
+    access_token:session.access_token,
+    refresh_token:session.refresh_token,
+    expires_at:(session.expires_at||0)*1000,
+    user:{id:session.user.id,email:session.user.email}
+  }:null;
+};
 const getMeta=async k=>{const r=await DB.all('SELECT v FROM meta WHERE k=?',[k]);return r[0]?r[0].v:null};
 const setMeta=(k,v)=>DB.run('INSERT OR REPLACE INTO meta VALUES(?,?)',[k,String(v)]);
-async function authCall(path,body){
-  const r=await fetch(CFG.url+'/auth/v1/'+path,{method:'POST',headers:{apikey:CFG.key,'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j=await r.json();if(!r.ok)throw new Error(j.error_description||j.msg||j.message||'Request failed');return j}
-const keep=j=>setAuth({access_token:j.access_token,refresh_token:j.refresh_token,expires_at:Date.now()+(j.expires_in-60)*1000,user:{id:j.user.id,email:j.user.email}});
 async function sb(path,o={}){
-  if(Date.now()>auth.expires_at)keep(await authCall('token?grant_type=refresh_token',{refresh_token:auth.refresh_token}));
-  const r=await fetch(CFG.url+path,{method:o.method||'GET',headers:{apikey:CFG.key,Authorization:'Bearer '+auth.access_token,'Content-Type':'application/json',...(o.headers||{})},body:o.body&&JSON.stringify(o.body)});
+  const {data,error}=await sbClient.auth.getSession();
+  if(error)throw error;
+  if(!data.session)throw new Error('Your session has expired. Please sign in again.');
+  const r=await fetch(CFG.url+path,{method:o.method||'GET',headers:{apikey:CFG.key,Authorization:'Bearer '+data.session.access_token,'Content-Type':'application/json',...(o.headers||{})},body:o.body&&JSON.stringify(o.body)});
   if(!r.ok)throw new Error(await r.text());return o.method==='POST'?null:r.json()}
 const snapshot=async()=>({anime:await DB.all('SELECT a.* FROM anime a JOIN entry e ON e.anime_id=a.id'),entry:await DB.all('SELECT * FROM entry'),cat:await DB.all('SELECT * FROM cat'),cat_item:await DB.all('SELECT * FROM cat_item')});
 async function restore(s){
@@ -235,21 +267,30 @@ async function sync(){
     }else if(ru>lu){await restore(rem.data);await setMeta('local_updated',ru);await reload()}
     else if(lu>ru)await push();
     setSyncMsg('Synced '+new Date().toLocaleTimeString());
-  }catch(e){setSyncMsg('Couldn’t sync (offline?). Changes are saved on this device and will sync later.')}
+  }catch(e){setSyncMsg('Sync failed: '+(e.message||'Unknown error')+'. Your local data is still on this device.')}
   render();
 }
 async function commit(){await setMeta('local_updated',Date.now());await reload();clearTimeout(pushT);if(auth)pushT=setTimeout(sync,1500)}
 function acctView(){
   if(!CFG.url)return`<div class="grp"><h3>Sync isn’t set up</h3><p>Add your Supabase URL and anon key at the top of app.js (README step 1). Until then your list is stored on this device only.</p></div>`;
   if(auth)return`<div class="grp"><h3>${esc(auth.user.email)}</h3><p>${esc(syncMsg||'Signed in.')}</p><button class="btn" data-a="syncnow">Sync now</button> <button class="btn ghost" data-a="signout">Sign out</button></div>`;
-  return`<div class="grp"><h3>Sign in to sync your list across devices</h3><p>${esc(syncMsg)}</p><div class="bar"><input id="em" type="email" placeholder="Email" autocomplete="username"><input id="pw" type="password" placeholder="Password (6+ characters)" autocomplete="current-password"></div><button class="btn" data-a="signin">Sign in</button> <button class="btn ghost" data-a="signup">Create account</button></div>`}
+  return`<div class="grp"><h3>Sign in to sync your list across devices</h3><p>${esc(syncMsg)}</p><div class="bar"><input id="em" type="email" placeholder="Email" autocomplete="username" value="${esc(accountEmail)}"><input id="pw" type="password" placeholder="Password (6+ characters)" autocomplete="current-password" value="${esc(accountPassword)}"></div><button class="btn" data-a="signin">Sign in</button> <button class="btn ghost" data-a="signup">Create account</button><div class="bar" style="margin-top:12px"><button class="btn ghost" data-a="google">Continue with Google</button><button class="btn ghost" data-a="github">Continue with GitHub</button></div></div>`}
  
 /* ---------- start ---------- */
 (async()=>{
   try{navigator.storage&&navigator.storage.persist&&navigator.storage.persist()}catch(e){}
   if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
   try{DB=await initDB()}catch(e){document.getElementById('app').innerHTML='<p class="empty">Could not start the local database: '+esc(e.message||e)+'</p>';return}
-  await reload();load(true);sync();
+  await reload();
+  const {data:{session},error:sessionError}=await sbClient.auth.getSession();
+  if(sessionError)syncMsg=sessionError.message;
+  setAuth(session);
+  sbClient.auth.onAuthStateChange((event,nextSession)=>{
+    setAuth(nextSession);
+    if(tab==='acct'&&!(document.activeElement&&['INPUT','TEXTAREA'].includes(document.activeElement.tagName)))render();
+  });
+  load(true);
+  if(auth)sync();
   window.addEventListener('online',sync);
   document.addEventListener('visibilitychange',()=>{if(!document.hidden)sync()});
 })();
