@@ -1,0 +1,41 @@
+
+:root{--bg:#f3f4fb;--sf:#fff;--ink:#1b1d3a;--mut:#6b6e94;--ln:#dcdef0;--ac:#e4416f;--ac2:#3b4cca;color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#12132b;--sf:#1c1e3d;--ink:#eceefc;--mut:#9396c2;--ln:#2e315c;--ac:#ff7a9f;--ac2:#8b9bff;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#12132b;--sf:#1c1e3d;--ink:#eceefc;--mut:#9396c2;--ln:#2e315c;--ac:#ff7a9f;--ac2:#8b9bff;color-scheme:dark}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:400 15px/1.45 'Bricolage Grotesque',system-ui,sans-serif}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:12px 24px;padding:18px 20px 0;max-width:1100px;margin:auto}
+h1{font-size:30px;font-weight:800;margin:0;letter-spacing:-.03em}h1 i{font-style:normal;color:var(--ac)}
+nav{display:flex;gap:4px;flex-wrap:wrap}nav button{border:0;background:none;color:var(--mut);font:600 15px inherit;font-family:inherit;padding:8px 14px;border-radius:99px;cursor:pointer}
+nav button.on{background:var(--ink);color:var(--bg)}
+main{max-width:1100px;margin:auto;padding:16px 20px 60px}
+button,select,input{font-family:inherit;font-size:14px;color:var(--ink)}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--ac2);outline-offset:2px}
+.bar{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}
+input,select{background:var(--sf);border:1px solid var(--ln);border-radius:10px;padding:8px 12px}
+input[type=search]{flex:1;min-width:180px}
+.btn{background:var(--ac);color:#fff;border:0;border-radius:10px;padding:8px 14px;font-weight:600;cursor:pointer}
+.ghost{background:var(--sf);color:var(--ink);border:1px solid var(--ln)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:14px}
+.card{background:var(--sf);border:1px solid var(--ln);border-radius:14px;overflow:hidden;display:flex;flex-direction:column}
+.cov{height:110px;display:flex;align-items:flex-end;padding:10px;font-weight:800;font-size:34px;color:#fff;letter-spacing:-.04em;position:relative}
+.add{position:absolute;top:8px;right:8px;width:32px;height:32px;border-radius:50%;border:0;background:#fff;color:#1b1d3a;font-size:20px;font-weight:800;cursor:pointer}
+.add.has{background:var(--ac);color:#fff;font-size:11px}
+.cb{padding:10px 12px}.cb b{display:block;font-size:14px;line-height:1.25}.cb small{color:var(--mut)}
+.row{display:flex;flex-wrap:wrap;align-items:center;gap:10px;background:var(--sf);border:1px solid var(--ln);border-radius:12px;padding:10px 14px;margin-bottom:8px}
+.row b{flex:1;min-width:160px}.rk{font-weight:800;font-size:22px;color:var(--ac);width:40px}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+.chip{border:1px solid var(--ln);background:var(--sf);border-radius:99px;padding:4px 12px;cursor:pointer;font-size:13px}.chip.on{background:var(--ac2);color:#fff;border-color:var(--ac2)}
+.grp{background:var(--sf);border:1px solid var(--ln);border-radius:14px;padding:14px 16px;margin-bottom:12px}
+.grp h3{margin:0 0 2px;font-size:17px}.grp p{margin:0 0 8px;color:var(--mut);font-size:13px}
+.tag{display:inline-block;background:var(--bg);border-radius:8px;padding:3px 9px;margin:2px;font-size:13px}
+.tag button{border:0;background:none;color:var(--mut);cursor:pointer}
+.empty{color:var(--mut);padding:30px 0;text-align:center}
+.ov{position:fixed;inset:0;background:rgba(10,10,30,.55);display:flex;align-items:center;justify-content:center;padding:20px;z-index:9}
+.dlg{background:var(--sf);border-radius:16px;padding:20px;width:100%;max-width:340px}
+.dlg h2{margin:0 0 12px;font-size:18px}.dlg .btn,.dlg .ghost{display:block;width:100%;margin-bottom:8px;text-align:left}
+.note{color:var(--mut);font-size:13px;margin:0 0 14px}
+
+.grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+.cov{height:auto;aspect-ratio:2/3;padding:10px;overflow:hidden}
+.cov img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.add{z-index:2;box-shadow:0 1px 6px #0006}
