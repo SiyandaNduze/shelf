@@ -39,3 +39,10 @@ input[type=search]{flex:1;min-width:180px}
 .cov{height:auto;aspect-ratio:2/3;padding:10px;overflow:hidden}
 .cov img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .add{z-index:2;box-shadow:0 1px 6px #0006}
+
+/* Related anime are shown as one franchise group in My list. */
+.franchise{background:var(--sf);border:1px solid var(--ln);border-radius:14px;padding:10px;margin:0 0 12px}
+.franchise-head{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:4px 12px;padding:4px 4px 10px}
+.franchise-head small{color:var(--mut);font-size:12px}
+.franchise .row{margin-bottom:6px}
+.franchise .row:last-child{margin-bottom:0}
