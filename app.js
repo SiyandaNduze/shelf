@@ -337,8 +337,9 @@ async function sync(){if(!auth||!CFG.url||!sbClient)return;if(syncPromise){syncR
     if(userChanged){
       const previousUser=await getMeta('user');
       const local=previousUser?{anime:[],entry:[],cat:[],cat_item:[]}:await snapshot();
-      await DB.batch([['DELETE FROM anime_rel']]);
+      if(previousUser)await DB.batch([['DELETE FROM anime'],['DELETE FROM anime_rel']]);
       await restore(rem?merge(rem.data,local):local);await setMeta('user',auth.user.id);await reload();
+      if(previousUser)await setMeta('local_updated',Date.now());
       await push(rem?rem.updated_at:null);
     }else if(rem&&lu>last&&ru>last){
       const local=await snapshot();await restore(merge(rem.data,local));await reload();await push(rem.updated_at);
