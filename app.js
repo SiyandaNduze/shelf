@@ -7,6 +7,7 @@ const GENRES=['Action','Adventure','Comedy','Drama','Fantasy','Horror','Mahou Sh
 const ST={p:'Plan to watch',w:'Watching',c:'Completed'};
 const SCHEMA=[
 'CREATE TABLE IF NOT EXISTS anime(id INTEGER PRIMARY KEY,title TEXT,year INT,eps INT,traits TEXT,cover TEXT)',
+'CREATE TABLE IF NOT EXISTS anime_rel(anime_id INTEGER PRIMARY KEY,related_ids TEXT)',
 'CREATE TABLE IF NOT EXISTS entry(anime_id INTEGER PRIMARY KEY,status TEXT,score INT DEFAULT 0,rnk REAL)',
 'CREATE TABLE IF NOT EXISTS cat(name TEXT PRIMARY KEY)',
 'CREATE TABLE IF NOT EXISTS cat_item(cat TEXT,anime_id INT,PRIMARY KEY(cat,anime_id))',
@@ -40,14 +41,15 @@ async function initDB(){
 }
  
 /* ---------- state ---------- */
-let L=[],cats={},seen={},items=[],page=1,more=false,busy=false,offline=false;
+let L=[],cats={},seen={},items=[],page=1,more=false,busy=false,offline=false,relationMap={};
 let tab='browse',q='',gen='',flt='all',srt='title',dlg=null,timer;
 const parse=r=>({...r,traits:JSON.parse(r.traits||'[]')});
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const inL=id=>L.find(a=>a.id==id);
 async function reload(){
   L=(await DB.all('SELECT a.*,e.status,e.score,e.rnk FROM entry e JOIN anime a ON a.id=e.anime_id')).map(parse);
-  L.forEach(a=>seen[a.id]=a);cats={};
+  L.forEach(a=>seen[a.id]=a);cats={};relationMap={};
+  for(const r of await DB.all('SELECT anime_id,related_ids FROM anime_rel')){try{relationMap[r.anime_id]=JSON.parse(r.related_ids||'[]').map(Number)}catch(e){relationMap[r.anime_id]=[]}}
   for(const c of await DB.all('SELECT name FROM cat'))cats[c.name]=[];
   for(const r of await DB.all('SELECT * FROM cat_item'))if(cats[r.cat])cats[r.cat].push(+r.anime_id);
 }
@@ -60,6 +62,7 @@ async function setStatus(id,s){
     await DB.run('INSERT INTO entry VALUES(?,?,?,?) ON CONFLICT(anime_id) DO UPDATE SET status=excluded.status,rnk=excluded.rnk',[id,s,ex?ex.score:0,rnk]);
   }
   await commit();
+  if(s)await refreshRelations();
 }
  
 /* ---------- catalog (AniList) ---------- */
@@ -79,6 +82,54 @@ async function load(reset){
   busy=false;render();
 }
  
+/* ---------- AniList franchise relationships ---------- */
+const RELATION_TYPES=new Set(['SEQUEL','PREQUEL','PARENT','SIDE_STORY','SPIN_OFF','ALTERNATIVE','SUMMARY','COMPILATION','CONTAINS']);
+const REL_QUERY=`query($ids:[Int]){Page(page:1,perPage:50){media(id_in:$ids,type:ANIME){id relations{edges{relationType node{id type}}}}}}`;
+async function refreshRelations(){
+  if(!L.length||!navigator.onLine)return;
+  const cached=new Set(Object.keys(relationMap).map(Number));
+  let frontier=L.map(a=>+a.id),visited=new Set(),changed=false;
+  for(let depth=0;depth<5&&frontier.length&&visited.size<300;depth++){
+    const batch=frontier.filter(id=>!visited.has(id)).slice(0,300-visited.size);
+    if(!batch.length)break;
+    const missing=batch.filter(id=>!cached.has(id));
+    for(let i=0;i<missing.length;i+=40){
+      const ids=missing.slice(i,i+40);
+      try{
+        const response=await fetch('https://graphql.anilist.co',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:REL_QUERY,variables:{ids}})});
+        if(!response.ok)throw new Error('AniList relationship lookup failed');
+        const payload=await response.json();if(payload.errors)throw new Error('AniList relationship lookup failed');
+        const found=new Set();
+        for(const media of payload.data.Page.media){
+          const related=media.relations.edges.filter(e=>RELATION_TYPES.has(e.relationType)&&e.node.type==='ANIME').map(e=>+e.node.id);
+          relationMap[media.id]=related;cached.add(+media.id);found.add(+media.id);changed=true;
+          await DB.run('INSERT OR REPLACE INTO anime_rel VALUES(?,?)',[+media.id,JSON.stringify(related)]);
+        }
+        // Cache missing records as empty only when AniList returned the requested media.
+        for(const id of ids)if(!found.has(id)){relationMap[id]=[];cached.add(id);changed=true;await DB.run('INSERT OR REPLACE INTO anime_rel VALUES(?,?)',[id,'[]'])}
+      }catch(e){return}
+    }
+    batch.forEach(id=>visited.add(id));
+    frontier=batch.flatMap(id=>relationMap[id]||[]).filter(id=>!visited.has(id)&&!cached.has(id));
+    // Cached neighbors still need to be traversed so a franchise can connect through an unlisted season.
+    const cachedNeighbors=batch.flatMap(id=>relationMap[id]||[]).filter(id=>!visited.has(id));
+    frontier=[...new Set(frontier.concat(cachedNeighbors))];
+  }
+  if(changed){await reload();if(tab==='list')render()}
+}
+function franchiseGroups(){
+  const parent=new Map();
+  const find=x=>{if(!parent.has(x))parent.set(x,x);if(parent.get(x)!==x)parent.set(x,find(parent.get(x)));return parent.get(x)};
+  const unite=(a,b)=>{const x=find(a),y=find(b);if(x!==y)parent.set(Math.max(x,y),Math.min(x,y))};
+  for(const [id,links] of Object.entries(relationMap))for(const other of links)unite(+id,+other);
+  const groups=new Map();
+  for(const a of L){const root=find(+a.id);if(!groups.has(root))groups.set(root,[]);groups.get(root).push(a)}
+  return [...groups.values()].map(members=>{
+    members.sort((a,b)=>(a.year||9999)-(b.year||9999)||a.title.length-b.title.length||a.title.localeCompare(b.title));
+    return{title:members[0].title,items:members,completed:members.every(a=>a.status==='c')};
+  }).sort((a,b)=>a.title.localeCompare(b.title));
+}
+
 /* ---------- auto categories: greedy grouping by most-shared trait ---------- */
 function auto(){
   const cnt={};L.forEach(a=>a.traits.forEach(g=>cnt[g]=(cnt[g]||0)+1));
@@ -103,11 +154,17 @@ function render(){
   let h='';
   if(tab==='browse')h=`<div class="bar"><input type="search" id="q" placeholder="Search every anime on AniList" value="${esc(q)}"><select id="gen"><option value="">All genres</option>${GENRES.map(g=>`<option ${g===gen?'selected':''}>${g}</option>`).join('')}</select></div>`+
     (offline?'<p class="note">You’re offline. Showing anime you’ve already viewed on this device.</p>':'')+
-    `<div class="grid">${items.map(card).join('')}</div>`+(busy?'<p class="empty">Loading…</p>':more?'<p class="empty"><button class="btn" data-a="more">Load more</button></p>':items.length?'':'<p class="empty">No anime found.</p>');
+    `<div class="grid">${items.filter(a=>{const saved=inL(a.id);return !saved||saved.status!=='c'}).map(card).join('')}</div>`+(busy?'<p class="empty">Loading…</p>':more?'<p class="empty"><button class="btn" data-a="more">Load more</button></p>':items.some(a=>{const saved=inL(a.id);return !saved||saved.status!=='c'})?'':'<p class="empty">No uncompleted anime in these results.</p>');
   if(tab==='list'){
-    const r=L.filter(a=>flt==='all'||a.status===flt).sort((p,q)=>srt==='title'?p.title.localeCompare(q.title):srt==='year'?p.year-q.year:q.score-p.score);
-    h=`<div class="bar"><div class="chips">${[['all','All'],['p','Plan to watch'],['w','Watching'],['c','Completed']].map(([k,n])=>`<button class="chip ${flt===k?'on':''}" data-a="flt" data-v="${k}">${n}</button>`).join('')}</div><select id="srt">${[['title','Sort: title'],['year','Sort: year'],['score','Sort: score']].map(([k,n])=>`<option value="${k}" ${srt===k?'selected':''}>${n}</option>`).join('')}</select></div>`+
-    (r.length?r.map(a=>`<div class="row"><b>${esc(a.title)}<br><small style="color:var(--mut);font-weight:400">${a.year||'?'} · ${a.eps||'?'} ep</small></b><select data-a="st" data-id="${a.id}">${Object.entries(ST).map(([k,n])=>`<option value="${k}" ${a.status===k?'selected':''}>${n}</option>`).join('')}</select><select data-a="sc" data-id="${a.id}"><option value="0">Score</option>${[10,9,8,7,6,5,4,3,2,1].map(n=>`<option ${a.score===n?'selected':''}>${n}</option>`).join('')}</select><button class="btn ghost" data-a="rm" data-id="${a.id}">Remove</button></div>`).join(''):'<p class="empty">Nothing here yet. Browse and press + on an anime.</p>');
+    const groups=franchiseGroups();
+    const counts={all:groups.length,p:groups.filter(g=>g.items.some(a=>a.status==='p')).length,w:groups.filter(g=>g.items.some(a=>a.status==='w')).length,c:groups.filter(g=>g.completed).length};
+    const visible=groups.filter(g=>flt==='all'||(flt==='c'?g.completed:g.items.some(a=>a.status===flt))).sort((a,b)=>{
+      const p=a.items[0],q=b.items[0];return srt==='title'?a.title.localeCompare(b.title):srt==='year'?(p.year||0)-(q.year||0):Math.max(...b.items.map(x=>x.score||0))-Math.max(...a.items.map(x=>x.score||0));
+    });
+    const row=a=>`<div class="row"><b>${esc(a.title)}<br><small style="color:var(--mut);font-weight:400">${a.year||'?'} · ${a.eps||'?'} ep</small></b><select data-a="st" data-id="${a.id}">${Object.entries(ST).map(([k,n])=>`<option value="${k}" ${a.status===k?'selected':''}>${n}</option>`).join('')}</select><select data-a="sc" data-id="${a.id}"><option value="0">Score</option>${[10,9,8,7,6,5,4,3,2,1].map(n=>`<option ${a.score===n?'selected':''}>${n}</option>`).join('')}</select><button class="btn ghost" data-a="rm" data-id="${a.id}">Remove</button></div>`;
+    const group=g=>g.items.length===1?row(g.items[0]):`<section class="franchise"><div class="franchise-head"><b>${esc(g.title)}</b><small>${g.items.length} related entries · ${g.items.filter(a=>a.status==='c').length}/${g.items.length} completed</small></div>${g.items.map(row).join('')}</section>`;
+    h=`<div class="bar"><div class="chips">${[['all','All'],['p','Plan to watch'],['w','Watching'],['c','Completed']].map(([k,n])=>`<button class="chip ${flt===k?'on':''}" data-a="flt" data-v="${k}">${n} (${counts[k]})</button>`).join('')}</div><select id="srt">${[['title','Sort: title'],['year','Sort: year'],['score','Sort: score']].map(([k,n])=>`<option value="${k}" ${srt===k?'selected':''}>${n}</option>`).join('')}</select></div>`+
+    (visible.length?visible.map(group).join(''):'<p class="empty">Nothing here yet. Browse and press + on an anime.</p>');
   }
   if(tab==='rank'){
     const r=L.filter(a=>a.status==='c').sort((a,b)=>(a.rnk||1e9)-(b.rnk||1e9));
@@ -241,19 +298,21 @@ async function sb(path,o={}){
   if(!data.session)throw new Error('Your session has expired. Please sign in again.');
   const r=await fetch(CFG.url+path,{method:o.method||'GET',headers:{apikey:CFG.key,Authorization:'Bearer '+data.session.access_token,'Content-Type':'application/json',...(o.headers||{})},body:o.body&&JSON.stringify(o.body)});
   if(!r.ok)throw new Error(await r.text());return o.method==='POST'?null:r.json()}
-const snapshot=async()=>({anime:await DB.all('SELECT a.* FROM anime a JOIN entry e ON e.anime_id=a.id'),entry:await DB.all('SELECT * FROM entry'),cat:await DB.all('SELECT * FROM cat'),cat_item:await DB.all('SELECT * FROM cat_item')});
+const snapshot=async()=>({anime:await DB.all('SELECT a.* FROM anime a JOIN entry e ON e.anime_id=a.id'),entry:await DB.all('SELECT * FROM entry'),cat:await DB.all('SELECT * FROM cat'),cat_item:await DB.all('SELECT * FROM cat_item'),anime_rel:await DB.all('SELECT * FROM anime_rel')});
 async function restore(s){
-  for(const t of['entry','cat','cat_item'])await DB.run('DELETE FROM '+t);
+  for(const t of['entry','cat','cat_item','anime_rel'])await DB.run('DELETE FROM '+t);
   for(const a of s.anime)await DB.run('INSERT OR REPLACE INTO anime VALUES(?,?,?,?,?,?)',[a.id,a.title,a.year,a.eps,a.traits,a.cover]);
   for(const e of s.entry)await DB.run('INSERT INTO entry VALUES(?,?,?,?)',[e.anime_id,e.status,e.score,e.rnk]);
   for(const c of s.cat)await DB.run('INSERT INTO cat VALUES(?)',[c.name]);
   for(const c of s.cat_item)await DB.run('INSERT OR IGNORE INTO cat_item VALUES(?,?)',[c.cat,c.anime_id]);
+  for(const r of (s.anime_rel||[]))await DB.run('INSERT OR REPLACE INTO anime_rel VALUES(?,?)',[r.anime_id,r.related_ids||'[]']);
 }
 const merge=(r,l)=>{ // first sign-in on a device: keep everything from both
   const have=new Set(r.entry.map(e=>+e.anime_id));let mx=Math.max(0,...r.entry.map(e=>e.rnk||0));
   const extra=l.entry.filter(e=>!have.has(+e.anime_id)).map(e=>({...e,rnk:e.rnk==null?null:++mx})),ids=new Set(extra.map(e=>+e.anime_id));
   return{anime:r.anime.concat(l.anime.filter(a=>ids.has(+a.id))),entry:r.entry.concat(extra),
-    cat:[...new Map(r.cat.concat(l.cat).map(c=>[c.name,c])).values()],cat_item:r.cat_item.concat(l.cat_item)}};
+    cat:[...new Map(r.cat.concat(l.cat).map(c=>[c.name,c])).values()],cat_item:r.cat_item.concat(l.cat_item),
+    anime_rel:[...new Map((r.anime_rel||[]).concat(l.anime_rel||[]).map(x=>[+x.anime_id,x])).values()]}};
 async function push(){const t=Date.now();await setMeta('local_updated',t);
   await sb('/rest/v1/shelf_data',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:{user_id:auth.user.id,data:await snapshot(),updated_at:new Date(t).toISOString()}})}
 function setSyncMsg(m){syncMsg=m;if(tab==='acct'&&!(document.activeElement&&document.activeElement.tagName==='INPUT'))render()}
@@ -290,7 +349,8 @@ function acctView(){
     if(tab==='acct'&&!(document.activeElement&&['INPUT','TEXTAREA'].includes(document.activeElement.tagName)))render();
   });
   load(true);
-  if(auth)sync();
+  if(auth)sync().finally(()=>refreshRelations().catch(()=>{}));
+  else refreshRelations().catch(()=>{});
   window.addEventListener('online',sync);
   document.addEventListener('visibilitychange',()=>{if(!document.hidden)sync()});
 })();
