@@ -14,9 +14,9 @@ const SCHEMA=[
 'CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY,v TEXT)'];
  
 /* ---------- storage layer: same SQL everywhere ---------- */
-const idb=()=>new Promise((res,rej)=>{const r=indexedDB.open('shelf',1);r.onupgradeneeded=()=>r.result.createObjectStore('k');r.onsuccess=()=>res(r.result);r.onerror=rej});
-const idbGet=async()=>{const d=await idb();return new Promise(r=>{const q=d.transaction('k').objectStore('k').get('db');q.onsuccess=()=>r(q.result);q.onerror=()=>r()})};
-const idbSet=async b=>{const d=await idb();d.transaction('k','readwrite').objectStore('k').put(b,'db')};
+const idb=()=>new Promise((res,rej)=>{const r=indexedDB.open('shelf',1);r.onupgradeneeded=()=>{if(!r.result.objectStoreNames.contains('k'))r.result.createObjectStore('k')};r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error||new Error('IndexedDB unavailable'));r.onblocked=()=>rej(new Error('IndexedDB is blocked by another tab'))});
+const idbGet=async()=>{let d;try{d=await idb();return await new Promise((res,rej)=>{const q=d.transaction('k').objectStore('k').get('db');q.onsuccess=()=>res(q.result);q.onerror=()=>rej(q.error)})}catch(e){console.warn('Shelf local persistence unavailable:',e);return null}finally{if(d)d.close()}};
+const idbSet=async b=>{const d=await idb();try{await new Promise((res,rej)=>{const tx=d.transaction('k','readwrite');tx.objectStore('k').put(b,'db');tx.oncomplete=res;tx.onerror=()=>rej(tx.error);tx.onabort=()=>rej(tx.error||new Error('IndexedDB write aborted'))})}finally{d.close()}};
 const loadScript=src=>new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=rej;document.head.appendChild(s)});
 let DB;
 async function initDB(){
@@ -28,17 +28,21 @@ async function initDB(){
     await plug.execute({database,statements:SCHEMA.join(';')+';'});
     return{native:true,
       run:(s,v=[])=>plug.run({database,statement:s,values:v,transaction:false}),
-      batch:async ops=>{await plug.execute({database,statements:'BEGIN;'});try{for(const [s,v=[]] of ops)await plug.run({database,statement:s,values:v,transaction:false});await plug.execute({database,statements:'COMMIT;'});}catch(e){try{await plug.execute({database,statements:'ROLLBACK;'});}catch(_){}throw e;}},
+      batch:async ops=>{await plug.execute({database,statements:'BEGIN;',transaction:false});try{for(const [s,v=[]] of ops)await plug.run({database,statement:s,values:v,transaction:false});await plug.execute({database,statements:'COMMIT;',transaction:false});}catch(e){try{await plug.execute({database,statements:'ROLLBACK;',transaction:false});}catch(_){}throw e;}},
       all:async(s,v=[])=>(await plug.query({database,statement:s,values:v})).values||[]};
   }
-  await loadScript(CDN+'sql-wasm.js');
-  const SQL=await initSqlJs({locateFile:f=>CDN+f});
-  const d=new SQL.Database(await idbGet()||undefined);
-  SCHEMA.forEach(s=>d.run(s));
-  let t;const persist=()=>{clearTimeout(t);t=setTimeout(()=>idbSet(d.export()),250)};
+  let base=CDN;try{await loadScript(base+'sql-wasm.js')}catch(e){base='https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/';await loadScript(base+'sql-wasm.js')}
+  const SQL=await initSqlJs({locateFile:f=>base+f});
+  let d=new SQL.Database(await idbGet()||undefined);SCHEMA.forEach(s=>d.run(s));
+  const channel='BroadcastChannel'in window?new BroadcastChannel('shelf-db'):null;
+  const locked=fn=>navigator.locks&&navigator.locks.request?navigator.locks.request('shelf-db-write',{mode:'exclusive'},fn):fn();
+  const refresh=async()=>{const latest=await idbGet();if(latest){d.close();d=new SQL.Database(latest)}};
+  const persist=async()=>{try{await idbSet(d.export());if(channel)channel.postMessage({type:'changed'})}catch(e){console.warn('Shelf could not persist local data:',e)}};
+  if(channel)channel.onmessage=async()=>{try{await locked(refresh);if(DB&&DB.native===false){await reload();render()}}catch(e){console.warn('Shelf cross-tab refresh failed:',e)}};
   return{native:false,
-    run:async(s,v=[])=>{d.run(s,v);persist()},
-    batch:async ops=>{d.run('BEGIN');try{for(const [s,v=[]] of ops)d.run(s,v);d.run('COMMIT');persist()}catch(e){try{d.run('ROLLBACK')}catch(_){}throw e}},
+    run:async(s,v=[])=>locked(async()=>{await refresh();d.run(s,v);await persist()}),
+    batch:async ops=>locked(async()=>{await refresh();d.run('BEGIN');try{for(const [s,v=[]] of ops)d.run(s,v);d.run('COMMIT');await persist()}catch(e){try{d.run('ROLLBACK')}catch(_){}throw e}}),
+    refresh:()=>locked(refresh),
     all:async(s,v=[])=>{const st=d.prepare(s);st.bind(v);const r=[];while(st.step())r.push(st.getAsObject());st.free();return r}};
 }
  
@@ -65,6 +69,7 @@ async function setStatus(id,s){
   }
   await commit();
   if(s&&navigator.onLine)refreshRelations().catch(()=>{});
+  if(s==='c'&&tab==='browse')await load(false,false);
 }
  
 /* ---------- catalog (AniList) ---------- */
@@ -75,23 +80,27 @@ async function fetchAnime(requestPage=page){
   return{more:P.pageInfo.hasNextPage,items:P.media.map(m=>({id:m.id,title:m.title.english||m.title.romaji,year:m.seasonYear||0,eps:m.episodes||0,
     traits:[...m.genres,...m.tags.filter(t=>t.rank>=60).slice(0,3).map(t=>t.name)],cover:m.coverImage.large}))};
 }
-async function load(reset){
-  const token=++loadToken;if(reset){items=[];page=1;more=true}busy=true;render();
-  try{let next=page,hasMore=more,added=[];while(hasMore&&added.filter(a=>{const x=inL(a.id);return !x||x.status!=='c'}).length<visibleTarget){const r=await fetchAnime(next);if(token!==loadToken)return;added=added.concat(r.items);hasMore=r.more;next++;if(!r.items.length)break;}
+async function load(reset,appendMore=false){
+  const token=++loadToken;if(reset){items=[];page=1;more=true}
+  const visibleNow=items.filter(a=>{const x=inL(a.id);return !x||x.status!=='c'}).length;
+  const target=reset||appendMore?visibleTarget:Math.max(0,visibleTarget-visibleNow);
+  if(!target){busy=false;render();return}
+  busy=true;render();
+  try{let next=page,hasMore=more,added=[];while(hasMore&&added.filter(a=>{const x=inL(a.id);return !x||x.status!=='c'}).length<target){const r=await fetchAnime(next);if(token!==loadToken)return;added=added.concat(r.items);hasMore=r.more;next++;if(!r.items.length)break;}
     if(token!==loadToken)return;items=reset?added:items.concat(added);page=next;more=hasMore;offline=false;for(const a of added){seen[a.id]=inL(a.id)||a;await saveAnime(a)}
   }catch(e){if(token!==loadToken)return;offline=true;more=false;if(reset){items=(await DB.all('SELECT * FROM anime WHERE title LIKE ? ORDER BY title LIMIT 120',['%'+q+'%'])).map(parse).filter(a=>!gen||a.traits.includes(gen));for(const a of items)seen[a.id]=inL(a.id)||a}}
   if(token!==loadToken)return;busy=false;render();
 }
  
 /* ---------- AniList franchise relationships ---------- */
-const RELATION_TYPES=new Set(['SEQUEL','PREQUEL','PARENT','SIDE_STORY','SPIN_OFF','ALTERNATIVE']);
+const RELATION_TYPES=new Set(['SEQUEL','PREQUEL','PARENT','SIDE_STORY','SPIN_OFF']);
 const REL_QUERY=`query($ids:[Int]){Page(page:1,perPage:50){media(id_in:$ids,type:ANIME){id relations{edges{relationType node{id type}}}}}}`;
 async function refreshRelations(){
   if(!L.length||!navigator.onLine)return;
   const cached=new Set(Object.keys(relationMap).map(Number));
   let frontier=L.map(a=>+a.id),visited=new Set(),changed=false;
-  for(let depth=0;depth<5&&frontier.length&&visited.size<300;depth++){
-    const batch=frontier.filter(id=>!visited.has(id)).slice(0,300-visited.size);
+  for(let depth=0;depth<10&&frontier.length&&visited.size<1000;depth++){
+    const batch=frontier.filter(id=>!visited.has(id)).slice(0,1000-visited.size);
     if(!batch.length)break;
     const missing=batch.filter(id=>!cached.has(id));
     for(let i=0;i<missing.length;i+=40){
@@ -116,7 +125,7 @@ async function refreshRelations(){
     const cachedNeighbors=batch.flatMap(id=>relationMap[id]||[]).filter(id=>!visited.has(id));
     frontier=[...new Set(frontier.concat(cachedNeighbors))];
   }
-  if(changed){await commit();if(tab==='list')render()}
+  if(changed){await reload();if(tab==='list')render()}
 }
 function franchiseGroups(){
   const parent=new Map();
@@ -218,7 +227,7 @@ document.addEventListener('click',async e=>{
   if(a==='tab')tab=v;
   else if(a==='plus')dlg=id;
   else if(a==='close')dlg=null;
-  else if(a==='more'){page++;return load(false)}
+  else if(a==='more'){return load(false,true)}
   else if(a==='set'){await setStatus(dlg,v);dlg=null}
   else if(a==='flt')flt=v;
   else if(a==='rm')await setStatus(id,'');
@@ -244,7 +253,7 @@ document.addEventListener('click',async e=>{
       }
       accountPassword='';
       syncMsg='Account created. Check your email to confirm, then return here to sign in.';
-    }catch(err){syncMsg=err.message}}
+    }catch(err){syncMsg=err.message}finally{accountPassword='';render()}}
   else if(a==='google'||a==='github'){
     try{
       const {error}=await sbClient.auth.signInWithOAuth({
@@ -258,8 +267,8 @@ document.addEventListener('click',async e=>{
   else if(a==='syncnow'){await sync();return}
   else if(a==='signout'){await sync();const bad=syncMsg.startsWith('Sync failed');
     if(!confirm(bad?'Some changes haven’t synced and will be lost. Sign out anyway?':'Sign out? Your list stays in your account.'))return;
-    const {error}=await sbClient.auth.signOut();if(error)syncMsg=error.message;
-    for(const t of['entry','cat','cat_item','anime','meta'])await DB.run('DELETE FROM '+t);setAuth(null);accountPassword='';syncMsg='';await reload()}
+    const {error}=await sbClient.auth.signOut();if(error){syncMsg=error.message;render();return}
+    await DB.batch(['entry','cat','cat_item','anime','anime_rel','meta'].map(t=>['DELETE FROM '+t]));setAuth(null);accountPassword='';syncMsg='';await reload()}
   render();
 });
 document.addEventListener('input',e=>{
@@ -294,31 +303,49 @@ const setAuth=session=>{
 const getMeta=async k=>{const r=await DB.all('SELECT v FROM meta WHERE k=?',[k]);return r[0]?r[0].v:null};
 const setMeta=(k,v)=>DB.run('INSERT OR REPLACE INTO meta VALUES(?,?)',[k,String(v)]);
 async function sb(path,o={}){
-  const {data,error}=await sbClient.auth.getSession();
-  if(error)throw error;
+  const {data,error}=await sbClient.auth.getSession();if(error)throw error;
   if(!data.session)throw new Error('Your session has expired. Please sign in again.');
   const r=await fetch(CFG.url+path,{method:o.method||'GET',headers:{apikey:CFG.key,Authorization:'Bearer '+data.session.access_token,'Content-Type':'application/json',...(o.headers||{})},body:o.body&&JSON.stringify(o.body)});
-  if(!r.ok)throw new Error(await r.text());return o.method==='POST'?null:r.json()}
-const snapshot=async()=>({anime:await DB.all('SELECT a.* FROM anime a JOIN entry e ON e.anime_id=a.id'),entry:await DB.all('SELECT * FROM entry'),cat:await DB.all('SELECT * FROM cat'),cat_item:await DB.all('SELECT * FROM cat_item'),anime_rel:await DB.all('SELECT * FROM anime_rel')});
-async function restore(s){const ops=[['DELETE FROM entry'],['DELETE FROM cat'],['DELETE FROM cat_item'],['DELETE FROM anime_rel']];for(const a of s.anime||[])ops.push(['INSERT OR REPLACE INTO anime VALUES(?,?,?,?,?,?)',[a.id,a.title,a.year,a.eps,a.traits,a.cover]]);for(const e of s.entry||[])ops.push(['INSERT INTO entry VALUES(?,?,?,?)',[e.anime_id,e.status,e.score,e.rnk]]);for(const c of s.cat||[])ops.push(['INSERT INTO cat VALUES(?)',[c.name]]);for(const c of s.cat_item||[])ops.push(['INSERT OR IGNORE INTO cat_item VALUES(?,?)',[c.cat,c.anime_id]]);for(const r of (s.anime_rel||[]))ops.push(['INSERT OR REPLACE INTO anime_rel VALUES(?,?)',[r.anime_id,r.related_ids||'[]']]);await DB.batch(ops);
+  if(!r.ok)throw new Error(await r.text());if(r.status===204)return null;return r.json()}
+const snapshot=async()=>({anime:await DB.all('SELECT a.* FROM anime a JOIN entry e ON e.anime_id=a.id'),entry:await DB.all('SELECT * FROM entry'),cat:await DB.all('SELECT * FROM cat'),cat_item:await DB.all('SELECT * FROM cat_item')});
+async function restore(s){const ops=[['DELETE FROM entry'],['DELETE FROM cat'],['DELETE FROM cat_item']];for(const a of s.anime||[])ops.push(['INSERT OR REPLACE INTO anime VALUES(?,?,?,?,?,?)',[a.id,a.title,a.year,a.eps,a.traits,a.cover]]);for(const e of s.entry||[])ops.push(['INSERT INTO entry VALUES(?,?,?,?)',[e.anime_id,e.status,e.score,e.rnk]]);for(const c of s.cat||[])ops.push(['INSERT INTO cat VALUES(?)',[c.name]]);for(const c of s.cat_item||[])ops.push(['INSERT OR IGNORE INTO cat_item VALUES(?,?)',[c.cat,c.anime_id]]);await DB.batch(ops);
 }
-const merge=(r,l)=>{ // first sign-in on a device: keep everything from both
-  const have=new Set(r.entry.map(e=>+e.anime_id));let mx=Math.max(0,...r.entry.map(e=>e.rnk||0));
-  const extra=l.entry.filter(e=>!have.has(+e.anime_id)).map(e=>({...e,rnk:e.rnk==null?null:++mx})),ids=new Set(extra.map(e=>+e.anime_id));
-  return{anime:r.anime.concat(l.anime.filter(a=>ids.has(+a.id))),entry:r.entry.concat(extra),
-    cat:[...new Map(r.cat.concat(l.cat).map(c=>[c.name,c])).values()],cat_item:r.cat_item.concat(l.cat_item),
-    anime_rel:[...new Map((r.anime_rel||[]).concat(l.anime_rel||[]).map(x=>[+x.anime_id,x])).values()]}};
-async function push(){const t=Date.now();await setMeta('local_updated',t);
-  await sb('/rest/v1/shelf_data',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:{user_id:auth.user.id,data:await snapshot(),updated_at:new Date(t).toISOString()}})}
+const merge=(r,l)=>{
+  const anime=new Map((r.anime||[]).concat(l.anime||[]).map(a=>[+a.id,a]));
+  const entry=new Map((r.entry||[]).map(e=>[+e.anime_id,e]));for(const e of l.entry||[])entry.set(+e.anime_id,e);
+  return{anime:[...anime.values()],entry:[...entry.values()],
+    cat:[...new Map((r.cat||[]).concat(l.cat||[]).map(c=>[c.name,c])).values()],
+    cat_item:[...new Map((r.cat_item||[]).concat(l.cat_item||[]).map(c=>[c.cat+':'+c.anime_id,c])).values()]};
+};
+async function push(expectedUpdatedAt=null){
+  const t=Date.now(),body={user_id:auth.user.id,data:await snapshot(),updated_at:new Date(t).toISOString()};
+  if(expectedUpdatedAt){
+    const rows=await sb('/rest/v1/shelf_data?user_id=eq.'+encodeURIComponent(auth.user.id)+'&updated_at=eq.'+encodeURIComponent(expectedUpdatedAt),{method:'PATCH',headers:{Prefer:'return=representation'},body});
+    if(!rows||!rows.length)throw new Error('Your cloud list changed on another device during sync. Press Sync now to merge the latest changes safely.');
+  }else{
+    const rows=await sb('/rest/v1/shelf_data?on_conflict=user_id',{method:'POST',headers:{Prefer:'resolution=ignore-duplicates,return=representation'},body});
+    if(!rows||!rows.length)throw new Error('A cloud sync was created on another device. Press Sync now to merge it safely.');
+  }
+  await setMeta('local_updated',t);await setMeta('last_sync',t);return t;
+}
 function setSyncMsg(m){syncMsg=m;if(tab==='acct'&&!(document.activeElement&&document.activeElement.tagName==='INPUT'))render()}
 let syncPromise=null,syncRequested=false;
 async function sync(){if(!auth||!CFG.url||!sbClient)return;if(syncPromise){syncRequested=true;return syncPromise;}syncPromise=(async()=>{setSyncMsg('Syncing…');try{
     const rem=(await sb('/rest/v1/shelf_data?select=data,updated_at'))[0];
-    const lu=+(await getMeta('local_updated')||0),ru=rem?Date.parse(rem.updated_at):0;
-    if(await getMeta('user')!==String(auth.user.id)){
-      const l=await snapshot();await restore(rem?merge(rem.data,l):l);await setMeta('user',auth.user.id);await push();await reload();
-    }else if(ru>lu){await restore(rem.data);await setMeta('local_updated',ru);await reload()}
-    else if(lu>ru)await push();
+    const lu=+(await getMeta('local_updated')||0),ru=rem?Date.parse(rem.updated_at):0,last=+(await getMeta('last_sync')||0);
+    const userChanged=await getMeta('user')!==String(auth.user.id);
+    if(userChanged){
+      const previousUser=await getMeta('user');
+      const local=previousUser?{anime:[],entry:[],cat:[],cat_item:[]}:await snapshot();
+      await DB.batch([['DELETE FROM anime_rel']]);
+      await restore(rem?merge(rem.data,local):local);await setMeta('user',auth.user.id);await reload();
+      await push(rem?rem.updated_at:null);
+    }else if(rem&&lu>last&&ru>last){
+      const local=await snapshot();await restore(merge(rem.data,local));await reload();await push(rem.updated_at);
+    }else if(rem&&ru>lu){
+      await restore(rem.data);await setMeta('local_updated',ru);await setMeta('last_sync',ru);await reload();
+    }else if(!rem||lu>ru)await push(rem?rem.updated_at:null);
+    else await setMeta('last_sync',Math.max(lu,ru));
     setSyncMsg('Synced '+new Date().toLocaleTimeString());
   }catch(e){setSyncMsg('Sync failed: '+(e.message||'Unknown error')+'. Your local data is still on this device.')}
   render();})();try{await syncPromise}finally{syncPromise=null;if(syncRequested){syncRequested=false;sync()}}

@@ -1,7 +1,31 @@
-const C='shelf-v3',SHELL=['./','index.html','style.css','app.js','manifest.webmanifest','icon.svg'];
-self.addEventListener('install',e=>{self.skipWaiting();e.waitUntil(caches.open(C).then(c=>c.addAll(SHELL)))});
-self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(x=>x!==C).map(x=>caches.delete(x))))));
-self.addEventListener('fetch',e=>{const r=e.request,u=new URL(r.url);
-if(r.method!=='GET'||u.hostname.endsWith('supabase.co'))return; // never cache account/sync traffic
-const net=()=>fetch(r).then(n=>{const cp=n.clone();caches.open(C).then(c=>c.put(r,cp));return n});
-e.respondWith(u.origin===location.origin?net().catch(()=>caches.match(r)):caches.match(r).then(h=>h||net()))});
+const CACHE='shelf-v4';
+const SHELL=['./','index.html','style.css','app.js','manifest.webmanifest','icon.svg'];
+self.addEventListener('install',event=>{
+  self.skipWaiting();
+  event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll(SHELL)));
+});
+self.addEventListener('activate',event=>{
+  event.waitUntil((async()=>{
+    const keys=await caches.keys();
+    await Promise.all(keys.filter(key=>key!==CACHE).map(key=>caches.delete(key)));
+    await self.clients.claim();
+  })());
+});
+self.addEventListener('fetch',event=>{
+  const request=event.request;
+  if(request.method!=='GET')return;
+  const url=new URL(request.url);
+  if(url.origin!==self.location.origin||url.search||url.pathname.includes('/auth/')||url.hostname.endsWith('supabase.co'))return;
+  event.respondWith((async()=>{
+    const cache=await caches.open(CACHE);
+    try{
+      const response=await fetch(request);
+      if(response.ok&&response.type==='basic')await cache.put(request,response.clone());
+      return response;
+    }catch(error){
+      const cached=await cache.match(request);
+      if(cached)return cached;
+      throw error;
+    }
+  })());
+});
