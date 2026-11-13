@@ -28,6 +28,7 @@ async function initDB(){
     await plug.execute({database,statements:SCHEMA.join(';')+';'});
     return{native:true,
       run:(s,v=[])=>plug.run({database,statement:s,values:v,transaction:false}),
+      batch:async ops=>{await plug.execute({database,statements:'BEGIN;'});try{for(const [s,v=[]] of ops)await plug.run({database,statement:s,values:v,transaction:false});await plug.execute({database,statements:'COMMIT;'});}catch(e){try{await plug.execute({database,statements:'ROLLBACK;'});}catch(_){}throw e;}},
       all:async(s,v=[])=>(await plug.query({database,statement:s,values:v})).values||[]};
   }
   await loadScript(CDN+'sql-wasm.js');
@@ -37,11 +38,12 @@ async function initDB(){
   let t;const persist=()=>{clearTimeout(t);t=setTimeout(()=>idbSet(d.export()),250)};
   return{native:false,
     run:async(s,v=[])=>{d.run(s,v);persist()},
+    batch:async ops=>{d.run('BEGIN');try{for(const [s,v=[]] of ops)d.run(s,v);d.run('COMMIT');persist()}catch(e){try{d.run('ROLLBACK')}catch(_){}throw e}},
     all:async(s,v=[])=>{const st=d.prepare(s);st.bind(v);const r=[];while(st.step())r.push(st.getAsObject());st.free();return r}};
 }
  
 /* ---------- state ---------- */
-let L=[],cats={},seen={},items=[],page=1,more=false,busy=false,offline=false,relationMap={};
+let L=[],cats={},seen={},items=[],page=1,more=false,busy=false,offline=false,relationMap={},loadToken=0,visibleTarget=30;
 let tab='browse',q='',gen='',flt='all',srt='title',dlg=null,timer;
 const parse=r=>({...r,traits:JSON.parse(r.traits||'[]')});
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -62,28 +64,27 @@ async function setStatus(id,s){
     await DB.run('INSERT INTO entry VALUES(?,?,?,?) ON CONFLICT(anime_id) DO UPDATE SET status=excluded.status,rnk=excluded.rnk',[id,s,ex?ex.score:0,rnk]);
   }
   await commit();
-  if(s)await refreshRelations();
+  if(s&&navigator.onLine)refreshRelations().catch(()=>{});
 }
  
 /* ---------- catalog (AniList) ---------- */
-async function fetchAnime(){
+async function fetchAnime(requestPage=page){
   const r=await fetch('https://graphql.anilist.co',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({query:GQL,variables:{q:q||undefined,g:gen||undefined,p:page,s:[q?'SEARCH_MATCH':'POPULARITY_DESC']}})});
-  const P=(await r.json()).data.Page;
+    body:JSON.stringify({query:GQL,variables:{q:q||undefined,g:gen||undefined,p:requestPage,s:[q?'SEARCH_MATCH':'POPULARITY_DESC']}})});
+  if(!r.ok)throw new Error('AniList request failed ('+r.status+')');const json=await r.json();if(json.errors||!json.data||!json.data.Page)throw new Error('AniList returned an invalid response');const P=json.data.Page;
   return{more:P.pageInfo.hasNextPage,items:P.media.map(m=>({id:m.id,title:m.title.english||m.title.romaji,year:m.seasonYear||0,eps:m.episodes||0,
     traits:[...m.genres,...m.tags.filter(t=>t.rank>=60).slice(0,3).map(t=>t.name)],cover:m.coverImage.large}))};
 }
 async function load(reset){
-  if(reset){items=[];page=1}busy=true;render();
-  try{const r=await fetchAnime();items=items.concat(r.items);more=r.more;offline=false;
-    r.items.forEach(a=>{seen[a.id]=inL(a.id)||a;saveAnime(a)})}
-  catch(e){offline=true;more=false;
-    if(reset)items=(await DB.all('SELECT * FROM anime WHERE title LIKE ? ORDER BY title LIMIT 90',['%'+q+'%'])).map(parse).filter(a=>!gen||a.traits.includes(gen))}
-  busy=false;render();
+  const token=++loadToken;if(reset){items=[];page=1;more=true}busy=true;render();
+  try{let next=page,hasMore=more,added=[];while(hasMore&&added.filter(a=>{const x=inL(a.id);return !x||x.status!=='c'}).length<visibleTarget){const r=await fetchAnime(next);if(token!==loadToken)return;added=added.concat(r.items);hasMore=r.more;next++;if(!r.items.length)break;}
+    if(token!==loadToken)return;items=reset?added:items.concat(added);page=next;more=hasMore;offline=false;for(const a of added){seen[a.id]=inL(a.id)||a;await saveAnime(a)}
+  }catch(e){if(token!==loadToken)return;offline=true;more=false;if(reset){items=(await DB.all('SELECT * FROM anime WHERE title LIKE ? ORDER BY title LIMIT 120',['%'+q+'%'])).map(parse).filter(a=>!gen||a.traits.includes(gen));for(const a of items)seen[a.id]=inL(a.id)||a}}
+  if(token!==loadToken)return;busy=false;render();
 }
  
 /* ---------- AniList franchise relationships ---------- */
-const RELATION_TYPES=new Set(['SEQUEL','PREQUEL','PARENT','SIDE_STORY','SPIN_OFF','ALTERNATIVE','SUMMARY','COMPILATION','CONTAINS']);
+const RELATION_TYPES=new Set(['SEQUEL','PREQUEL','PARENT','SIDE_STORY','SPIN_OFF','ALTERNATIVE']);
 const REL_QUERY=`query($ids:[Int]){Page(page:1,perPage:50){media(id_in:$ids,type:ANIME){id relations{edges{relationType node{id type}}}}}}`;
 async function refreshRelations(){
   if(!L.length||!navigator.onLine)return;
@@ -232,7 +233,7 @@ document.addEventListener('click',async e=>{
   else if(a==='signin'||a==='signup'){
     const em=document.getElementById('em').value.trim(),pw=document.getElementById('pw').value;
     try{
-      syncMsg='';
+      if(!sbClient)throw new Error('Supabase is unavailable. Your local list still works.');syncMsg='';
       const redirectTo=window.location.origin+window.location.pathname;
       const result=a==='signin'
         ? await sbClient.auth.signInWithPassword({email:em,password:pw})
@@ -279,9 +280,9 @@ document.addEventListener('change',async e=>{
  
 /* ---------- accounts & sync (Supabase REST, last-write-wins) ---------- */
 let auth=null,syncMsg='',pushT,accountEmail='',accountPassword='';
-const sbClient=window.supabase.createClient(CFG.url,CFG.key,{
+const sbClient=window.supabase&&CFG.url&&CFG.key?window.supabase.createClient(CFG.url,CFG.key,{
   auth:{flowType:'pkce',detectSessionInUrl:true,persistSession:true,autoRefreshToken:true}
-});
+}):null;
 const setAuth=session=>{
   auth=session?{
     access_token:session.access_token,
@@ -299,13 +300,7 @@ async function sb(path,o={}){
   const r=await fetch(CFG.url+path,{method:o.method||'GET',headers:{apikey:CFG.key,Authorization:'Bearer '+data.session.access_token,'Content-Type':'application/json',...(o.headers||{})},body:o.body&&JSON.stringify(o.body)});
   if(!r.ok)throw new Error(await r.text());return o.method==='POST'?null:r.json()}
 const snapshot=async()=>({anime:await DB.all('SELECT a.* FROM anime a JOIN entry e ON e.anime_id=a.id'),entry:await DB.all('SELECT * FROM entry'),cat:await DB.all('SELECT * FROM cat'),cat_item:await DB.all('SELECT * FROM cat_item'),anime_rel:await DB.all('SELECT * FROM anime_rel')});
-async function restore(s){
-  for(const t of['entry','cat','cat_item','anime_rel'])await DB.run('DELETE FROM '+t);
-  for(const a of s.anime)await DB.run('INSERT OR REPLACE INTO anime VALUES(?,?,?,?,?,?)',[a.id,a.title,a.year,a.eps,a.traits,a.cover]);
-  for(const e of s.entry)await DB.run('INSERT INTO entry VALUES(?,?,?,?)',[e.anime_id,e.status,e.score,e.rnk]);
-  for(const c of s.cat)await DB.run('INSERT INTO cat VALUES(?)',[c.name]);
-  for(const c of s.cat_item)await DB.run('INSERT OR IGNORE INTO cat_item VALUES(?,?)',[c.cat,c.anime_id]);
-  for(const r of (s.anime_rel||[]))await DB.run('INSERT OR REPLACE INTO anime_rel VALUES(?,?)',[r.anime_id,r.related_ids||'[]']);
+async function restore(s){const ops=[['DELETE FROM entry'],['DELETE FROM cat'],['DELETE FROM cat_item'],['DELETE FROM anime_rel']];for(const a of s.anime||[])ops.push(['INSERT OR REPLACE INTO anime VALUES(?,?,?,?,?,?)',[a.id,a.title,a.year,a.eps,a.traits,a.cover]]);for(const e of s.entry||[])ops.push(['INSERT INTO entry VALUES(?,?,?,?)',[e.anime_id,e.status,e.score,e.rnk]]);for(const c of s.cat||[])ops.push(['INSERT INTO cat VALUES(?)',[c.name]]);for(const c of s.cat_item||[])ops.push(['INSERT OR IGNORE INTO cat_item VALUES(?,?)',[c.cat,c.anime_id]]);for(const r of (s.anime_rel||[]))ops.push(['INSERT OR REPLACE INTO anime_rel VALUES(?,?)',[r.anime_id,r.related_ids||'[]']]);await DB.batch(ops);
 }
 const merge=(r,l)=>{ // first sign-in on a device: keep everything from both
   const have=new Set(r.entry.map(e=>+e.anime_id));let mx=Math.max(0,...r.entry.map(e=>e.rnk||0));
@@ -316,9 +311,8 @@ const merge=(r,l)=>{ // first sign-in on a device: keep everything from both
 async function push(){const t=Date.now();await setMeta('local_updated',t);
   await sb('/rest/v1/shelf_data',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:{user_id:auth.user.id,data:await snapshot(),updated_at:new Date(t).toISOString()}})}
 function setSyncMsg(m){syncMsg=m;if(tab==='acct'&&!(document.activeElement&&document.activeElement.tagName==='INPUT'))render()}
-async function sync(){
-  if(!auth||!CFG.url)return;setSyncMsg('Syncing…');
-  try{
+let syncPromise=null,syncRequested=false;
+async function sync(){if(!auth||!CFG.url||!sbClient)return;if(syncPromise){syncRequested=true;return syncPromise;}syncPromise=(async()=>{setSyncMsg('Syncing…');try{
     const rem=(await sb('/rest/v1/shelf_data?select=data,updated_at'))[0];
     const lu=+(await getMeta('local_updated')||0),ru=rem?Date.parse(rem.updated_at):0;
     if(await getMeta('user')!==String(auth.user.id)){
@@ -327,11 +321,11 @@ async function sync(){
     else if(lu>ru)await push();
     setSyncMsg('Synced '+new Date().toLocaleTimeString());
   }catch(e){setSyncMsg('Sync failed: '+(e.message||'Unknown error')+'. Your local data is still on this device.')}
-  render();
+  render();})();try{await syncPromise}finally{syncPromise=null;if(syncRequested){syncRequested=false;sync()}}
 }
 async function commit(){await setMeta('local_updated',Date.now());await reload();clearTimeout(pushT);if(auth)pushT=setTimeout(sync,1500)}
 function acctView(){
-  if(!CFG.url)return`<div class="grp"><h3>Sync isn’t set up</h3><p>Add your Supabase URL and anon key at the top of app.js (README step 1). Until then your list is stored on this device only.</p></div>`;
+  if(!CFG.url||!sbClient)return`<div class="grp"><h3>Cloud sync unavailable</h3><p>Supabase could not load or is not configured. Shelf will continue working with local storage; sign-in and cloud sync are temporarily unavailable.</p></div>`;
   if(auth)return`<div class="grp"><h3>${esc(auth.user.email)}</h3><p>${esc(syncMsg||'Signed in.')}</p><button class="btn" data-a="syncnow">Sync now</button> <button class="btn ghost" data-a="signout">Sign out</button></div>`;
   return`<div class="grp"><h3>Sign in to sync your list across devices</h3><p>${esc(syncMsg)}</p><div class="bar"><input id="em" type="email" placeholder="Email" autocomplete="username" value="${esc(accountEmail)}"><input id="pw" type="password" placeholder="Password (6+ characters)" autocomplete="current-password" value="${esc(accountPassword)}"></div><button class="btn" data-a="signin">Sign in</button> <button class="btn ghost" data-a="signup">Create account</button><div class="bar" style="margin-top:12px"><button class="btn ghost" data-a="google">Continue with Google</button><button class="btn ghost" data-a="github">Continue with GitHub</button></div></div>`}
  
@@ -341,16 +335,8 @@ function acctView(){
   if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
   try{DB=await initDB()}catch(e){document.getElementById('app').innerHTML='<p class="empty">Could not start the local database: '+esc(e.message||e)+'</p>';return}
   await reload();
-  const {data:{session},error:sessionError}=await sbClient.auth.getSession();
-  if(sessionError)syncMsg=sessionError.message;
-  setAuth(session);
-  sbClient.auth.onAuthStateChange((event,nextSession)=>{
-    setAuth(nextSession);
-    if(tab==='acct'&&!(document.activeElement&&['INPUT','TEXTAREA'].includes(document.activeElement.tagName)))render();
-  });
-  load(true);
-  if(auth)sync().finally(()=>refreshRelations().catch(()=>{}));
-  else refreshRelations().catch(()=>{});
+  if(sbClient){const {data:{session},error:sessionError}=await sbClient.auth.getSession();if(sessionError)syncMsg=sessionError.message;setAuth(session);sbClient.auth.onAuthStateChange((event,nextSession)=>{setAuth(nextSession);if(tab==='acct'&&!(document.activeElement&&['INPUT','TEXTAREA'].includes(document.activeElement.tagName)))render();});}else syncMsg='Cloud sync unavailable; local mode is active.';
+  load(true);if(auth)sync().finally(()=>refreshRelations().catch(()=>{}));else refreshRelations().catch(()=>{});
   window.addEventListener('online',sync);
   document.addEventListener('visibilitychange',()=>{if(!document.hidden)sync()});
 })();
