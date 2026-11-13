@@ -115,7 +115,7 @@ async function refreshRelations(){
     const cachedNeighbors=batch.flatMap(id=>relationMap[id]||[]).filter(id=>!visited.has(id));
     frontier=[...new Set(frontier.concat(cachedNeighbors))];
   }
-  if(changed){await reload();if(tab==='list')render()}
+  if(changed){await commit();if(tab==='list')render()}
 }
 function franchiseGroups(){
   const parent=new Map();
