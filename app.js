@@ -14,8 +14,8 @@ const SCHEMA=[
 'CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY,v TEXT)'];
  
 /* ---------- storage layer: same SQL everywhere ---------- */
-const idb=()=>new Promise((res,rej)=>{const r=indexedDB.open('shelf',1);r.onupgradeneeded=()=>{if(!r.result.objectStoreNames.contains('k'))r.result.createObjectStore('k')};r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error||new Error('IndexedDB unavailable'));r.onblocked=()=>rej(new Error('IndexedDB is blocked by another tab'))});
-const idbGet=async()=>{let d;try{d=await idb();return await new Promise((res,rej)=>{const q=d.transaction('k').objectStore('k').get('db');q.onsuccess=()=>res(q.result);q.onerror=()=>rej(q.error)})}catch(e){console.warn('Shelf local persistence unavailable:',e);return null}finally{if(d)d.close()}};
+const idb=()=>new Promise((res,rej)=>{const r=indexedDB.open('shelf',2);r.onupgradeneeded=()=>{if(!r.result.objectStoreNames.contains('k'))r.result.createObjectStore('k')};r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error||new Error('IndexedDB unavailable'));r.onblocked=()=>rej(new Error('IndexedDB is blocked by another tab'))});
+const idbGet=async()=>{let d;try{d=await idb();return await new Promise((res,rej)=>{const q=d.transaction('k').objectStore('k').get('db');q.onsuccess=()=>res(q.result);q.onerror=()=>rej(q.error)})}finally{if(d)d.close()}};
 const idbSet=async b=>{const d=await idb();try{await new Promise((res,rej)=>{const tx=d.transaction('k','readwrite');tx.objectStore('k').put(b,'db');tx.oncomplete=res;tx.onerror=()=>rej(tx.error);tx.onabort=()=>rej(tx.error||new Error('IndexedDB write aborted'))})}finally{d.close()}};
 const loadScript=src=>new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=rej;document.head.appendChild(s)});
 let DB;
@@ -35,15 +35,25 @@ async function initDB(){
   const SQL=await initSqlJs({locateFile:f=>base+f});
   let d=new SQL.Database(await idbGet()||undefined);SCHEMA.forEach(s=>d.run(s));
   const channel='BroadcastChannel'in window?new BroadcastChannel('shelf-db'):null;
-  const locked=fn=>navigator.locks&&navigator.locks.request?navigator.locks.request('shelf-db-write',{mode:'exclusive'},fn):fn();
+  const leaseLock=async fn=>{
+    const owner=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);
+    while(true){
+      const store=await idb();let acquired=false;
+      try{await new Promise((resolve,reject)=>{const tx=store.transaction('k','readwrite'),os=tx.objectStore('k'),get=os.get('write-lock');get.onsuccess=()=>{const lock=get.result;if(!lock||lock.until<Date.now()){os.put({owner,until:Date.now()+120000},'write-lock');acquired=true}};tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||new Error('Could not acquire local database lock'))})}finally{store.close()}
+      if(acquired)break;
+      await new Promise(resolve=>setTimeout(resolve,40+Math.random()*60));
+    }
+    try{return await fn()}finally{const store=await idb();try{await new Promise((resolve,reject)=>{const tx=store.transaction('k','readwrite'),os=tx.objectStore('k'),get=os.get('write-lock');get.onsuccess=()=>{if(get.result&&get.result.owner===owner)os.delete('write-lock')};tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||new Error('Could not release local database lock'))})}finally{store.close()}}
+  };
+  const locked=fn=>navigator.locks&&navigator.locks.request?navigator.locks.request('shelf-db-write',{mode:'exclusive'},fn):leaseLock(fn);
   const refresh=async()=>{const latest=await idbGet();if(latest){d.close();d=new SQL.Database(latest)}};
-  const persist=async()=>{try{await idbSet(d.export());if(channel)channel.postMessage({type:'changed'})}catch(e){console.warn('Shelf could not persist local data:',e)}};
+  const persist=async()=>{await idbSet(d.export());if(channel)channel.postMessage({type:'changed'})};
   if(channel)channel.onmessage=async()=>{try{await locked(refresh);if(DB&&DB.native===false){await reload();render()}}catch(e){console.warn('Shelf cross-tab refresh failed:',e)}};
   return{native:false,
-    run:async(s,v=[])=>locked(async()=>{await refresh();d.run(s,v);await persist()}),
-    batch:async ops=>locked(async()=>{await refresh();d.run('BEGIN');try{for(const [s,v=[]] of ops)d.run(s,v);d.run('COMMIT');await persist()}catch(e){try{d.run('ROLLBACK')}catch(_){}throw e}}),
+    run:async(s,v=[])=>locked(async()=>{await refresh();try{d.run(s,v);await persist()}catch(e){await refresh();throw new Error('Local save failed: '+(e.message||e))}}),
+    batch:async ops=>locked(async()=>{await refresh();d.run('BEGIN');try{for(const [s,v=[]] of ops)d.run(s,v);d.run('COMMIT');await persist()}catch(e){try{d.run('ROLLBACK')}catch(_){}await refresh();throw new Error('Local save failed: '+(e.message||e))}}),
     refresh:()=>locked(refresh),
-    all:async(s,v=[])=>{const st=d.prepare(s);st.bind(v);const r=[];while(st.step())r.push(st.getAsObject());st.free();return r}};
+    all:async(s,v=[])=>locked(async()=>{await refresh();const st=d.prepare(s);st.bind(v);const r=[];try{while(st.step())r.push(st.getAsObject())}finally{st.free()}return r})};
 }
  
 /* ---------- state ---------- */
@@ -177,9 +187,9 @@ function render(){
     (visible.length?visible.map(group).join(''):'<p class="empty">Nothing here yet. Browse and press + on an anime.</p>');
   }
   if(tab==='rank'){
-    const r=L.filter(a=>a.status==='c').sort((a,b)=>(a.rnk||1e9)-(b.rnk||1e9));
-    h=`<div class="bar"><button class="btn" data-a="byscore">Sort by score</button></div><p class="note">Your completed anime, best first. Use the arrows to reorder.</p>`+
-    (r.length?r.map((a,i)=>`<div class="row"><span class="rk">${i+1}</span><b>${esc(a.title)}</b><small>${a.score?'★ '+a.score:'unscored'}</small><button class="btn ghost" data-a="up" data-id="${a.id}" aria-label="Move up">▲</button><button class="btn ghost" data-a="dn" data-id="${a.id}" aria-label="Move down">▼</button></div>`).join(''):'<p class="empty">Mark anime as Completed to rank them.</p>');
+    const r=franchiseGroups().filter(g=>g.completed).sort((a,b)=>Math.min(...a.items.map(x=>x.rnk||1e9))-Math.min(...b.items.map(x=>x.rnk||1e9)));
+    h=`<div class="bar"><button class="btn" data-a="byscore">Sort by score</button></div><p class="note">Completed franchises, counted once. Use the arrows to reorder.</p>`+
+    (r.length?r.map((g,i)=>{const score=Math.max(...g.items.map(x=>x.score||0));return `<div class="row"><span class="rk">${i+1}</span><b>${esc(g.title)}${g.items.length>1?'<small style="color:var(--mut);font-weight:400"> · '+g.items.length+' entries</small>':''}</b><small>${score?'★ '+score:'unscored'}</small><button class="btn ghost" data-a="up" data-id="${g.items[0].id}" aria-label="Move up">▲</button><button class="btn ghost" data-a="dn" data-id="${g.items[0].id}" aria-label="Move down">▼</button></div>`}).join(''):'<p class="empty">Mark anime as Completed to rank them.</p>');
   }
   if(tab==='cats')h=`<h2>Your categories</h2><div class="bar"><input id="nc" placeholder="New category, e.g. Comfort watches"><button class="btn" data-a="newcat">Create</button></div>`+
     (Object.keys(cats).map(c=>`<div class="grp"><h3>${esc(c)}</h3><div>${cats[c].filter(inL).map(id=>`<span class="tag">${esc(inL(id).title)} <button data-a="uncat" data-c="${esc(c)}" data-id="${id}" aria-label="Remove">×</button></span>`).join('')||'<p>Empty</p>'}</div><div class="bar" style="margin:8px 0 0"><select data-a="addcat" data-c="${esc(c)}"><option value="">Add from my list…</option>${L.filter(a=>!cats[c].includes(+a.id)).map(a=>`<option value="${a.id}">${esc(a.title)}</option>`).join('')}</select><button class="btn ghost" data-a="delcat" data-c="${esc(c)}">Delete</button></div></div>`).join('')||'<p class="empty">No categories yet.</p>')+
@@ -232,10 +242,10 @@ document.addEventListener('click',async e=>{
   else if(a==='flt')flt=v;
   else if(a==='rm')await setStatus(id,'');
   else if(a==='up'||a==='dn'){
-    const r=L.filter(x=>x.status==='c').sort((p,q)=>(p.rnk||1e9)-(q.rnk||1e9)),i=r.findIndex(x=>x.id==id),j=a==='up'?i-1:i+1;
-    if(r[j]){await DB.run('UPDATE entry SET rnk=? WHERE anime_id=?',[j+1,id]);await DB.run('UPDATE entry SET rnk=? WHERE anime_id=?',[i+1,r[j].id]);
-      for(let k=0;k<r.length;k++)if(k!==i&&k!==j)await DB.run('UPDATE entry SET rnk=? WHERE anime_id=?',[k+1,r[k].id]);await commit()}}
-  else if(a==='byscore'){const r=L.filter(x=>x.status==='c').sort((p,q)=>q.score-p.score);for(let k=0;k<r.length;k++)await DB.run('UPDATE entry SET rnk=? WHERE anime_id=?',[k+1,r[k].id]);await commit()}
+    const groups=franchiseGroups().filter(g=>g.completed).sort((p,q)=>Math.min(...p.items.map(x=>x.rnk||1e9))-Math.min(...q.items.map(x=>x.rnk||1e9)));
+    const i=groups.findIndex(g=>g.items.some(x=>x.id===id)),j=a==='up'?i-1:i+1;
+    if(i>=0&&groups[j]){[groups[i],groups[j]]=[groups[j],groups[i]];const ops=[];groups.forEach((g,k)=>g.items.forEach(x=>ops.push(['UPDATE entry SET rnk=? WHERE anime_id=?',[k+1,x.id]])));await DB.batch(ops);await commit()}}
+  else if(a==='byscore'){const groups=franchiseGroups().filter(g=>g.completed).sort((p,q)=>Math.max(...q.items.map(x=>x.score||0))-Math.max(...p.items.map(x=>x.score||0)));const ops=[];groups.forEach((g,k)=>g.items.forEach(x=>ops.push(['UPDATE entry SET rnk=? WHERE anime_id=?',[k+1,x.id]])));await DB.batch(ops);await commit()}
   else if(a==='newcat'){const n=document.getElementById('nc').value.trim();if(n){await DB.run('INSERT OR IGNORE INTO cat VALUES(?)',[n]);await commit()}}
   else if(a==='delcat'){await DB.run('DELETE FROM cat WHERE name=?',[t.dataset.c]);await DB.run('DELETE FROM cat_item WHERE cat=?',[t.dataset.c]);await commit()}
   else if(a==='uncat'){await DB.run('DELETE FROM cat_item WHERE cat=? AND anime_id=?',[t.dataset.c,id]);await commit()}
@@ -256,6 +266,7 @@ document.addEventListener('click',async e=>{
     }catch(err){syncMsg=err.message}finally{accountPassword='';render()}}
   else if(a==='google'||a==='github'){
     try{
+      if(!sbClient)throw new Error('Supabase is unavailable. Your local list still works.');
       const {error}=await sbClient.auth.signInWithOAuth({
         provider:a,
         options:{redirectTo:window.location.origin+window.location.pathname}
@@ -363,7 +374,7 @@ function acctView(){
   if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
   try{DB=await initDB()}catch(e){document.getElementById('app').innerHTML='<p class="empty">Could not start the local database: '+esc(e.message||e)+'</p>';return}
   await reload();
-  if(sbClient){const {data:{session},error:sessionError}=await sbClient.auth.getSession();if(sessionError)syncMsg=sessionError.message;setAuth(session);sbClient.auth.onAuthStateChange((event,nextSession)=>{setAuth(nextSession);if(tab==='acct'&&!(document.activeElement&&['INPUT','TEXTAREA'].includes(document.activeElement.tagName)))render();});}else syncMsg='Cloud sync unavailable; local mode is active.';
+  if(sbClient){const {data:{session},error:sessionError}=await sbClient.auth.getSession();if(sessionError)syncMsg=sessionError.message;setAuth(session);sbClient.auth.onAuthStateChange((event,nextSession)=>{const hadAuth=!!auth;setAuth(nextSession);if(tab==='acct'&&!(document.activeElement&&['INPUT','TEXTAREA'].includes(document.activeElement.tagName)))render();if(nextSession&&(!hadAuth||event==='SIGNED_IN'))Promise.resolve().then(()=>sync());});}else syncMsg='Cloud sync unavailable; local mode is active.';
   load(true);if(auth)sync().finally(()=>refreshRelations().catch(()=>{}));else refreshRelations().catch(()=>{});
   window.addEventListener('online',sync);
   document.addEventListener('visibilitychange',()=>{if(!document.hidden)sync()});

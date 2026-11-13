@@ -79,17 +79,19 @@ npx cap open android          # run from Android Studio
 
 app.js detects Capacitor and switches to the native SQLite plugin automatically.
 
-Sync notes: local SQLite remains the offline copy and syncs to your account when online. Newest whole-list snapshot wins, so simultaneous edits on multiple devices can overwrite each other. Signing out clears the device copy but leaves the cloud list in your account.
+Sync notes: local SQLite remains the offline copy and syncs to your account when online. Cloud writes use conditional updates to detect concurrent changes; simultaneous changes are merged where possible, and conflicts are surfaced rather than silently overwriting the cloud row. Signing out clears the device copy but leaves the cloud list in your account.
 
 ## 6. Franchise grouping and completed items
 
-My list groups AniList-linked anime entries (such as seasons, sequels, side stories, spin-offs, and related films/OVAs/specials) into one franchise group. The Completed filter counts a group once, and only when every entry in that group is marked Completed. Individual entries remain editable inside the group. Completed entries are hidden from Browse results but remain in My list. AniList relationship data is cached locally and included in cloud sync; the app refreshes it while online. Unlinked titles remain separate rather than being guessed together by similar names.
+My list groups AniList-linked anime entries (such as seasons, sequels, side stories, spin-offs, and related films/OVAs/specials) into one franchise group. The Completed filter counts a group once, and only when every entry in that group is marked Completed. Individual entries remain editable inside the group. Completed entries are hidden from Browse results but remain in My list. AniList relationship data is cached locally (not uploaded to cloud sync); the app refreshes it while online. Unlinked titles remain separate rather than being guessed together by similar names.
 
 
 ## 7. Reliability notes
 
+Rankings group completed franchise entries and count each completed franchise once.
+
 - Browse automatically fetches replacement results after an anime is marked Completed. Load more advances to the next AniList page without skipping a page.
-- Browser writes are persisted before the database operation completes. Where the browser supports the Web Locks API, tabs serialize writes and refresh from the shared IndexedDB snapshot; other tabs refresh after a change notification.
+- Browser writes are persisted before the database operation completes; IndexedDB failures are reported instead of being treated as successful saves. Tabs use the Web Locks API where available and an IndexedDB lease lock otherwise, and reads refresh from the shared snapshot.
 - Cloud writes use a conditional update. If another device changes the cloud row during a sync, Shelf reports a conflict rather than silently overwriting the newer snapshot. A later sync merges independent additions and edits; local values win for entries edited on both devices. The current whole-snapshot format does not keep per-entry deletion tombstones, so an offline deletion can still be reintroduced by a merge.
 - Franchise links are local catalog cache, not account data, and are cleared on sign-out or account switching. Ambiguous alternative adaptations are not automatically merged.
 - The service worker caches successful same-origin responses only. It does not cache third-party APIs, authentication, or query-string traffic.
