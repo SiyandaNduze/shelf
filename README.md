@@ -80,3 +80,7 @@ npx cap open android          # run from Android Studio
 app.js detects Capacitor and switches to the native SQLite plugin automatically.
 
 Sync notes: local SQLite remains the offline copy and syncs to your account when online. Newest whole-list snapshot wins, so simultaneous edits on multiple devices can overwrite each other. Signing out clears the device copy but leaves the cloud list in your account.
+
+## 6. Franchise grouping and completed items
+
+My list groups AniList-linked anime entries (such as seasons, sequels, side stories, spin-offs, and related films/OVAs/specials) into one franchise group. The Completed filter counts a group once, and only when every entry in that group is marked Completed. Individual entries remain editable inside the group. Completed entries are hidden from Browse results but remain in My list. AniList relationship data is cached locally and included in cloud sync; the app refreshes it while online. Unlinked titles remain separate rather than being guessed together by similar names.
