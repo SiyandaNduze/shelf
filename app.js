@@ -170,7 +170,7 @@ function auto(){
 const hue=t=>{let h=0;for(const c of t)h=(h*31+c.charCodeAt(0))%360;return h};
 const card=a=>{const x=inL(a.id);return`<div class="card"><div class="cov" style="background:hsl(${hue(a.title)} 50% 35%)"><img src="${esc(a.cover||'')}" alt="${esc(a.title)} cover" loading="lazy" onerror="this.remove()"><button class="add ${x?'has':''}" data-a="plus" data-id="${a.id}" aria-label="Add ${esc(a.title)} to list">${x?x.status.toUpperCase():'+'}</button></div><div class="cb"><b>${esc(a.title)}</b><small>${a.year||'?'} · ${a.eps||'?'} ep<br>${esc(a.traits.slice(0,2).join(', '))}</small></div></div>`};
 function render(){
-  document.getElementById('nav').innerHTML=[['browse','Browse'],['list','My list'],['rank','Rankings'],['cats','Categories'],['acct','Account']].map(([k,n])=>`<button class="${tab===k?'on':''}" data-a="tab" data-v="${k}">${n}${k==='list'?' ('+L.length+')':''}</button>`).join('');
+  document.getElementById('nav').innerHTML=[['browse','Browse'],['list','My list'],['rank','Rankings'],['cats','Categories'],['acct','Account']].map(([k,n])=>`<button class="${tab===k?'on':''}" data-a="tab" data-v="${k}">${n}${k==='list'?' ('+franchiseGroups().length+')':''}</button>`).join('');
   let h='';
   if(tab==='browse')h=`<div class="bar"><input type="search" id="q" placeholder="Search every anime on AniList" value="${esc(q)}"><select id="gen"><option value="">All genres</option>${GENRES.map(g=>`<option ${g===gen?'selected':''}>${g}</option>`).join('')}</select></div>`+
     (offline?'<p class="note">You’re offline. Showing anime you’ve already viewed on this device.</p>':'')+
